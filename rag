@@ -6,9 +6,11 @@ import json
 import logging
 import os
 import sys
+
 import hashlib
 import re
 from pathlib import Path
+
 from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
@@ -58,17 +60,20 @@ def embed(texts: list[str], cfg: dict) -> list[list[float]]:
     client = ol.Client(host=cfg["ollama_url"])
     results = []
     batch = cfg.get("embed_batch_size", 8)
-    for i in range(0, len(texts), batch):
+    total = len(texts)
+    batches = (total + batch - 1) // batch
+    for idx, i in enumerate(range(0, total, batch)):
         chunk = texts[i:i+batch]
+        print(f"   embedding batch {idx+1}/{batches} ({i+len(chunk)}/{total} chunks)...", end="\r", flush=True)
         try:
             resp = client.embed(model=cfg["embedding_model"], input=chunk)
             results.extend(resp.embeddings)
         except Exception:
-            # Retry one at a time on batch failure
-            logger.warning(f"Batch embed failed at {i}, retrying one at a time")
+            logger.warning(f"\n   Batch embed failed at {i}, retrying one at a time")
             for text in chunk:
                 resp = client.embed(model=cfg["embedding_model"], input=[text])
                 results.extend(resp.embeddings)
+    print()  # newline after \r progress
     return results
 
 
@@ -321,6 +326,7 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
                 title = soup.title.string.strip() if soup.title else ""
                 text = soup.get_text(separator="\n", strip=True)
                 pages.append({"url": current_url, "text": text, "title": title})
+                print(f"   crawled {len(pages)} pages (queue: {len(queue)})...", end="\r", flush=True)
 
                 if current_depth < depth:
                     for a in soup.find_all("a", href=True):
@@ -333,6 +339,7 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
                             queue.append((href, current_depth + 1))
 
             browser.close()
+        print()  # newline after \r progress
         return pages
     except ImportError:
         print("❌ playwright not installed. Run: pip install playwright && playwright install chromium")
@@ -409,7 +416,9 @@ def refresh_dir_source(source: dict, cfg: dict) -> dict:
         return source
 
     code_only = source_type == "codebase"
+    print(f"   scanning {dirpath.name}...", end="\r", flush=True)
     current_files = {str(f): f.stat().st_mtime for f in _collect_dir_files(dirpath, code_only)}
+    print(f"   scanned {len(current_files)} files — checking for changes...")
 
     # Files removed since last ingest → delete from Qdrant
     removed = set(old_manifest) - set(current_files)
