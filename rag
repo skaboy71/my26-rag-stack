@@ -298,6 +298,7 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
             except Exception:
                 pass  # network error or 404 → keep allow_all=True
 
+        notify(f"🔄 Crawling {url} (depth={depth})")
         visited, queued, queue, pages = set(), {url}, [(url, 0)], []
 
         with sync_playwright() as p:
@@ -351,7 +352,9 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
                 if len(pages) == 5 and q_len > 500:
                     print(f"\n   ⚠️  Queue is very large ({q_len}) after {len(pages)} pages — possible dedup issue")
                 if len(pages) > 5 and q_len > len(pages) * 100:
-                    print(f"\n   ❌ Queue ({q_len}) is >100x pages crawled ({len(pages)}) — aborting to prevent runaway crawl")
+                    msg = f"❌ Queue ({q_len}) is >100x pages crawled ({len(pages)}) — aborting runaway crawl on {url}"
+                    print(f"\n   {msg}")
+                    notify(msg, title="rag error", priority=1)
                     break
 
                 if current_depth < depth:
@@ -368,6 +371,7 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
 
             browser.close()
         print()  # newline after \r progress
+        notify(f"✅ Crawl done: {len(pages)} pages from {url}")
         return pages
     except ImportError:
         print("❌ playwright not installed. Run: pip install playwright && playwright install chromium")
@@ -388,6 +392,7 @@ def ingest_chunks(chunks: list[dict], collection: str, cfg: dict):
     ensure_collection(client, collection, vector_size)
     upsert_chunks(client, collection, chunks, vectors)
     print(f"✅ Ingested {len(chunks)} chunks → {collection}")
+    notify(f"✅ Ingested {len(chunks)} chunks → {collection}")
 
 
 def delete_file_points(client, collection: str, file_path: str):
@@ -566,6 +571,28 @@ def _save_persistent_source(cfg: dict, entry: dict):
     sources.append(entry)
     cfg["persistent_sources"] = sources
     save_config(cfg)
+
+
+# ── Pushover notifications ─────────────────────────────────────────────────────
+
+def notify(message: str, title: str = "rag", priority: int = 0):
+    """Send a Pushover notification if credentials are available."""
+    token = os.environ.get("PUSHOVER_TOKEN")
+    user  = os.environ.get("PUSHOVER_USER")
+    if not token or not user:
+        return
+    try:
+        import urllib.request, urllib.parse
+        data = urllib.parse.urlencode({
+            "token": token, "user": user,
+            "title": title, "message": message, "priority": priority
+        }).encode()
+        urllib.request.urlopen(
+            urllib.request.Request("https://api.pushover.net/1/messages.json", data=data),
+            timeout=5
+        )
+    except Exception as e:
+        logger.warning(f"Pushover notification failed: {e}")
 
 
 # ── Serve daemon ───────────────────────────────────────────────────────────────
@@ -1100,6 +1127,7 @@ def cmd_collections(args, cfg):
         cfg_data["persistent_sources"] = updated_sources
         save_config(cfg_data)
         print("\n✅ Refresh complete. Manifests updated.")
+        notify("✅ rag refresh complete")
 
     elif sub == "rebuild":
         name = args.name
