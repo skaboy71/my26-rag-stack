@@ -5,18 +5,19 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
-
 import hashlib
 import re
 from pathlib import Path
-
 from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(os.environ.get("RAG_CONFIG", str(Path.home() / ".config/rag/config.json")))
+RAG_SERVE_PORT = int(os.environ.get("RAG_SERVE_PORT", "8765"))
+RAG_SERVE_PID  = Path.home() / ".local/share/rag/rag-serve.pid"
 
 DEFAULT_CONFIG = {
     "qdrant_url": "http://localhost:6333",
@@ -540,6 +541,146 @@ def _save_persistent_source(cfg: dict, entry: dict):
     save_config(cfg)
 
 
+# ── Serve daemon ───────────────────────────────────────────────────────────────
+
+def _daemon_running() -> bool:
+    """Return True if rag serve is up and healthy."""
+    import urllib.request, urllib.error
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{RAG_SERVE_PORT}/health", timeout=1)
+        return True
+    except Exception:
+        return False
+
+
+def _query_via_daemon(query: str, top_k: int, collections: list[str], no_rerank: bool) -> list[dict] | None:
+    """Hit the rag serve daemon. Returns None if daemon is not running."""
+    import urllib.request, urllib.error
+    try:
+        data = json.dumps({"query": query, "top_k": top_k,
+                           "collections": collections, "no_rerank": no_rerank}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{RAG_SERVE_PORT}/query",
+            data=data, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def cmd_serve(args, cfg):
+    if args.stop:
+        if RAG_SERVE_PID.exists():
+            import signal
+            pid = int(RAG_SERVE_PID.read_text().strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+                RAG_SERVE_PID.unlink()
+                print(f"✅ rag serve stopped (PID {pid})")
+            except ProcessLookupError:
+                RAG_SERVE_PID.unlink()
+                print("⚠️  Process was already gone — PID file removed")
+        else:
+            print("⚠️  rag serve is not running")
+        return
+
+    if args.status:
+        if _daemon_running():
+            pid = RAG_SERVE_PID.read_text().strip() if RAG_SERVE_PID.exists() else "?"
+            print(f"✅ rag serve running  (PID {pid}, port {RAG_SERVE_PORT})")
+        else:
+            print("❌ rag serve not running")
+        return
+
+    if args.daemon:
+        import subprocess
+        RAG_SERVE_PID.parent.mkdir(parents=True, exist_ok=True)
+        log = open("/tmp/rag-serve.log", "w")
+        proc = subprocess.Popen(
+            [sys.executable, __file__, "serve"],
+            stdout=log, stderr=log, start_new_session=True,
+            env={**os.environ, "RAG_CONFIG": str(CONFIG_PATH),
+                 "RAG_SERVE_PORT": str(RAG_SERVE_PORT)}
+        )
+        RAG_SERVE_PID.write_text(str(proc.pid))
+        print(f"✅ rag serve starting in background (PID {proc.pid}, port {RAG_SERVE_PORT})")
+        print(f"   logs: tail -f /tmp/rag-serve.log")
+        print(f"   stop: rag serve --stop")
+        return
+
+    # Foreground server
+    try:
+        from fastapi import FastAPI
+        from fastapi.responses import JSONResponse
+        import uvicorn
+    except ImportError:
+        print("❌ fastapi/uvicorn not installed. Run: pip install fastapi uvicorn")
+        sys.exit(1)
+
+    app = FastAPI(title="rag-serve")
+
+    print(f"🔄 Loading reranker ({cfg['reranker_model']})...")
+    reranker_model = get_reranker(cfg)
+    print(f"✅ Reranker ready")
+
+    print(f"🔄 Warming up embedding model...")
+    try:
+        embed(["warmup"], cfg)
+        print(f"✅ Embedding model ready")
+    except Exception as e:
+        print(f"⚠️  Embedding warmup failed: {e} (will retry on first query)")
+
+    RAG_SERVE_PID.parent.mkdir(parents=True, exist_ok=True)
+    RAG_SERVE_PID.write_text(str(os.getpid()))
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "port": RAG_SERVE_PORT}
+
+    @app.post("/query")
+    def query_endpoint(body: dict):
+        import concurrent.futures
+        query_text = body.get("query", "")
+        top_k      = body.get("top_k", cfg["default_top_k"])
+        colls      = body.get("collections", cfg["collections"])
+        no_rerank  = body.get("no_rerank", False)
+
+        try:
+            vec = embed([query_text], cfg)[0]
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+        results = []
+        try:
+            client = get_qdrant(cfg)
+            with concurrent.futures.ThreadPoolExecutor() as ex:
+                futures = {ex.submit(search_collection, client, c, vec, top_k * 4): c for c in colls}
+                for f in concurrent.futures.as_completed(futures):
+                    results.extend(f.result())
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+        if not no_rerank and results:
+            pairs  = [(query_text, r["text"]) for r in results]
+            scores = reranker_model.predict(pairs).tolist()
+            for r, s in zip(results, scores):
+                r["score"] = float(s)
+            results.sort(key=lambda x: x["score"], reverse=True)
+        else:
+            results.sort(key=lambda x: x["score"], reverse=True)
+
+        return results[:top_k]
+
+    print(f"\n✅ rag serve listening on http://127.0.0.1:{RAG_SERVE_PORT}")
+    print(f"   Stop with: rag serve --stop  or  Ctrl-C\n")
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=RAG_SERVE_PORT, log_level="warning")
+    finally:
+        if RAG_SERVE_PID.exists():
+            RAG_SERVE_PID.unlink()
+
+
 # ── Commands ───────────────────────────────────────────────────────────────────
 
 def cmd_status(args, cfg):
@@ -596,6 +737,20 @@ def cmd_query(args, cfg):
     query = args.query
     top_k = args.top_k or cfg["default_top_k"]
     collections = args.collections.split(",") if args.collections else cfg["collections"]
+
+    # Try daemon first — avoids cold-loading the reranker
+    if _daemon_running():
+        results = _query_via_daemon(query, top_k, collections, args.no_rerank)
+        if results is not None:
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                for i, r in enumerate(results, 1):
+                    src = r["metadata"].get("file_path") or r["metadata"].get("source_url") or ""
+                    print(f"\n[{i}] score={r['score']:.3f} | {r['collection']} | {src}")
+                    print("─" * 60)
+                    print(r["text"][:400])
+            return
 
     # Embed query
     try:
@@ -974,6 +1129,12 @@ def main():
     a.add_argument("--persistent", action="store_true", help="Re-crawl on rag collections refresh")
     a.add_argument("--ignore-robots", action="store_true", help="Ignore robots.txt")
 
+    # serve
+    sv = sub.add_parser("serve", help="Start persistent query daemon (keeps reranker in memory)")
+    sv.add_argument("--daemon", action="store_true", help="Run in background")
+    sv.add_argument("--stop",   action="store_true", help="Stop the running daemon")
+    sv.add_argument("--status", action="store_true", help="Check if daemon is running")
+
     # collections
     c = sub.add_parser("collections", help="Manage collections")
     c.add_argument("subcommand", choices=["list", "status", "refresh", "rebuild"])
@@ -988,6 +1149,8 @@ def main():
 
     if args.command == "status":
         cmd_status(args, cfg)
+    elif args.command == "serve":
+        cmd_serve(args, cfg)
     elif args.command == "query":
         cmd_query(args, cfg)
     elif args.command == "add":

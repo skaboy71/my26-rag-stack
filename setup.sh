@@ -105,7 +105,8 @@ fi
 echo ""
 echo "▶ Installing Python dependencies..."
 pip install -q qdrant-client ollama sentence-transformers \
-               beautifulsoup4 playwright pypdf python-docx
+               beautifulsoup4 playwright pypdf python-docx \
+               fastapi uvicorn
 echo "  ✅ Python packages installed"
 
 echo ""
@@ -334,6 +335,7 @@ echo "║            Setup complete! ✅            ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 echo "  Run:  rag status"
+echo "  Then: rag serve --daemon   # start query daemon (fast queries)"
 echo ""
 if [[ "$OBSIDIAN_VAULT" == "" ]]; then
   echo "  ⚠️  Set your Obsidian vault path in: $CONFIG_FILE"

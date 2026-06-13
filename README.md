@@ -43,6 +43,16 @@ chmod +x setup.sh rag
 
 ## Usage
 
+### Query daemon (start this first — keeps reranker in memory for fast queries)
+
+```bash
+rag serve --daemon    # start in background (port 8765)
+rag serve --status    # check if running
+rag serve --stop      # stop it
+```
+
+First startup takes ~60s to load the reranker. After that, queries run in ~3-7s instead of ~2min. `rag query` automatically uses the daemon if it's running.
+
 ### Health check
 ```bash
 rag status
