@@ -266,6 +266,7 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
         seed_prefix = seed_parsed.scheme + "://" + seed_parsed.netloc + seed_parsed.path
 
         rp = urllib.robotparser.RobotFileParser()
+        rp.allow_all = True  # default: allow everything unless real robots.txt says otherwise
         if not ignore_robots:
             try:
                 import urllib.request
@@ -273,8 +274,10 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
                 with urllib.request.urlopen(robots_url, timeout=5) as resp:
                     content = resp.read().decode(errors="replace")
                 if "user-agent" in content.lower() and "<html" not in content.lower():
+                    rp.allow_all = False
                     rp.set_url(robots_url)
                     rp.parse(content.splitlines())
+                    rp._last_checked = 1
             except Exception:
                 pass
 
