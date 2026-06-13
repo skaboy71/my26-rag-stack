@@ -321,16 +321,34 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
                     logger.warning(f"Failed to load {current_url}: {e}")
                     continue
 
-                soup = BeautifulSoup(html, "html.parser")
-                for tag in soup(["script", "style", "nav", "footer", "header"]):
-                    tag.decompose()
-                title = soup.title.string.strip() if soup.title else ""
-                text = soup.get_text(separator="\n", strip=True)
+                # Use readability to extract clean article content (strips ads, nav, boilerplate)
+                try:
+                    from readability import Document
+                    doc = Document(html)
+                    title = doc.title() or ""
+                    clean_html = doc.summary()
+                    soup = BeautifulSoup(clean_html, "html.parser")
+                    text = soup.get_text(separator="\n", strip=True)
+                except Exception:
+                    # Fallback to basic BeautifulSoup extraction
+                    soup = BeautifulSoup(html, "html.parser")
+                    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                        tag.decompose()
+                    title = soup.title.string.strip() if soup.title else ""
+                    text = soup.get_text(separator="\n", strip=True)
+
+                # Use original soup for link extraction (readability strips links)
+                link_soup = BeautifulSoup(html, "html.parser")
+
+                if not text.strip():
+                    logger.warning(f"No content extracted from {current_url}")
+                    continue
+
                 pages.append({"url": current_url, "text": text, "title": title})
                 print(f"   crawled {len(pages)} pages (queue: {len(queue)})...", end="\r", flush=True)
 
                 if current_depth < depth:
-                    for a in soup.find_all("a", href=True):
+                    for a in link_soup.find_all("a", href=True):
                         href = urljoin(current_url, a["href"]).split("#")[0]
                         parsed = urlparse(href)
                         if (parsed.netloc == seed_domain

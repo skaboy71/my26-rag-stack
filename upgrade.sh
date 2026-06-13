@@ -156,7 +156,7 @@ fi
 # ── Python packages ───────────────────────────────────────────────────────────
 if [[ -z "$TARGET" || "$TARGET" == "python" ]]; then
   echo "▶ Python packages"
-  PACKAGES=(qdrant-client ollama sentence-transformers playwright pypdf python-docx beautifulsoup4 fastapi uvicorn)
+  PACKAGES=(qdrant-client ollama sentence-transformers playwright pypdf python-docx beautifulsoup4 fastapi uvicorn readability-lxml)
   OUTDATED=()
 
   for pkg in "${PACKAGES[@]}"; do

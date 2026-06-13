@@ -106,7 +106,7 @@ echo ""
 echo "▶ Installing Python dependencies..."
 pip install -q qdrant-client ollama sentence-transformers \
                beautifulsoup4 playwright pypdf python-docx \
-               fastapi uvicorn
+               fastapi uvicorn readability-lxml
 echo "  ✅ Python packages installed"
 
 echo ""
