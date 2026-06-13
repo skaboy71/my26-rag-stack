@@ -22,13 +22,13 @@ chmod +x setup.sh rag
 ./setup.sh
 
 # Remote Qdrant on home server / Unraid
-./setup.sh --remote-db 192.168.1.30
+./setup.sh --remote-db 192.168.x.x
 
 # Set Obsidian vault path during setup
 ./setup.sh --vault "/path/to/your/vault"
 
 # Remote DB + vault
-./setup.sh --remote-db 192.168.1.30 --vault "/path/to/vault"
+./setup.sh --remote-db 192.168.x.x --vault "/path/to/vault"
 
 # Skip Ollama install (already installed)
 ./setup.sh --skip-ollama

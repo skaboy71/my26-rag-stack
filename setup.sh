@@ -5,7 +5,7 @@
 #
 # Usage:
 #   ./setup.sh                          # local Qdrant (default)
-#   ./setup.sh --remote-db 192.168.1.30 # remote Qdrant on home server
+#   ./setup.sh --remote-db 192.168.x.x # remote Qdrant on home server
 #   ./setup.sh --vault ~/path/to/vault  # set Obsidian vault path
 #   ./setup.sh --skip-ollama            # skip Ollama install (already installed)
 #   ./setup.sh --skip-models            # skip model pulls
