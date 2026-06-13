@@ -1,8 +1,10 @@
 # my26-rag-stack
 
-Fully local RAG stack for macOS Apple Silicon. No cloud, no subscriptions, no Homebrew required.
+Fully local RAG stack for macOS and Linux. No cloud, no subscriptions, no Homebrew required.
 
 **Stack:** Qdrant · Ollama · qwen3-embedding:8b · BAAI/bge-reranker-v2-m3 · Playwright
+
+**Platforms:** macOS Apple Silicon · Linux x86_64 · Linux arm64 · Nvidia CUDA
 
 ---
 
@@ -143,7 +145,18 @@ Refresh only processes what changed — no full re-ingest:
 
 ## Requirements
 
-- macOS Apple Silicon (M1/M2/M3/M4)
+| Platform | Notes |
+|---|---|
+| macOS Apple Silicon (M1–M4) | Metal GPU acceleration |
+| Linux x86_64 | Nvidia CUDA auto-detected by Ollama installer |
+| Linux arm64 | CPU only (Raspberry Pi 5, Jetson, etc.) |
+
 - Python 3.10+
 - ~10GB disk (models + Qdrant data)
 - VPN if using remote Qdrant on home server
+- Nvidia drivers installed before setup if using CUDA
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to fork, test, and submit a PR.
+Found a bug? Open an [issue](https://github.com/skaboy71/my26-rag-stack/issues).

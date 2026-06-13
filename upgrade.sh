@@ -13,6 +13,9 @@
 
 set -e
 
+OS=$(uname -s)
+ARCH=$(uname -m)
+
 CHECK_ONLY=true
 UPGRADE_ALL=false
 TARGET=""
@@ -76,29 +79,35 @@ if [[ -z "$TARGET" || "$TARGET" == "ollama" ]]; then
     ok "Up to date"
   else
     warn "Update available: $current → $latest"
-    if ! $CHECK_ONLY && { [[ "$TARGET" == "ollama" ]] || prompt_upgrade "Ollama (recompiles from source, ~20min)"; }; then
-      echo "  Fetching $latest..."
-      OLLAMA_SRC="$HOME/src/ollama"
-      if [[ ! -d "$OLLAMA_SRC" ]]; then
-        git clone --depth 1 --branch "$latest" https://github.com/ollama/ollama "$OLLAMA_SRC"
+    if ! $CHECK_ONLY && { [[ "$TARGET" == "ollama" ]] || prompt_upgrade "Ollama"; }; then
+      if [[ "$OS" == "Linux" ]]; then
+        echo "  Running official Ollama installer..."
+        curl -fsSL https://ollama.com/install.sh | sh
+        ok "Ollama upgraded to $latest"
       else
+        echo "  Fetching $latest..."
+        OLLAMA_SRC="$HOME/src/ollama"
+        if [[ ! -d "$OLLAMA_SRC" ]]; then
+          git clone --depth 1 --branch "$latest" https://github.com/ollama/ollama "$OLLAMA_SRC"
+        else
+          cd "$OLLAMA_SRC"
+          git fetch --tags
+          git checkout "$latest"
+        fi
         cd "$OLLAMA_SRC"
-        git fetch --tags
-        git checkout "$latest"
+        echo "  Building llama-server (Metal, ~20min)..."
+        cmake -S llama/server --preset darwin -B build/llama-server-darwin > /tmp/ollama-cmake.log 2>&1
+        cmake --build build/llama-server-darwin >> /tmp/ollama-cmake.log 2>&1
+        mkdir -p "$HOME/.local/lib/ollama"
+        cp build/llama-server-darwin/bin/llama-server "$HOME/.local/lib/ollama/llama-server"
+        echo "  Building Ollama binary..."
+        go build -ldflags "-X github.com/ollama/ollama/version.Version=$latest" -o ollama .
+        launchctl unload "$HOME/Library/LaunchAgents/homebrew.mxcl.ollama.plist" 2>/dev/null || true
+        cp ollama "$INSTALL_DIR/ollama"
+        launchctl load "$HOME/Library/LaunchAgents/homebrew.mxcl.ollama.plist" 2>/dev/null || true
+        sleep 2
+        ok "Ollama upgraded to $latest"
       fi
-      cd "$OLLAMA_SRC"
-      echo "  Building llama-server (Metal)..."
-      cmake -S llama/server --preset darwin -B build/llama-server-darwin > /tmp/ollama-cmake.log 2>&1
-      cmake --build build/llama-server-darwin >> /tmp/ollama-cmake.log 2>&1
-      mkdir -p "$HOME/.local/lib/ollama"
-      cp build/llama-server-darwin/bin/llama-server "$HOME/.local/lib/ollama/llama-server"
-      echo "  Building Ollama binary..."
-      go build -ldflags "-X github.com/ollama/ollama/version.Version=$latest" -o ollama .
-      launchctl unload "$HOME/Library/LaunchAgents/homebrew.mxcl.ollama.plist" 2>/dev/null || true
-      cp ollama "$INSTALL_DIR/ollama"
-      launchctl load "$HOME/Library/LaunchAgents/homebrew.mxcl.ollama.plist" 2>/dev/null || true
-      sleep 2
-      ok "Ollama upgraded to $latest"
     fi
   fi
   echo ""
@@ -116,12 +125,25 @@ if [[ -z "$TARGET" || "$TARGET" == "qdrant" ]]; then
     else
       warn "Update available: $current → $latest"
       if ! $CHECK_ONLY && { [[ "$TARGET" == "qdrant" ]] || prompt_upgrade "Qdrant (binary download)"; }; then
-        QDRANT_URL="https://github.com/qdrant/qdrant/releases/download/${latest}/qdrant-aarch64-apple-darwin.tar.gz"
+        case "$(uname -s)-$(uname -m)" in
+          Darwin-arm64)   TARBALL="qdrant-aarch64-apple-darwin.tar.gz" ;;
+          Linux-x86_64)   TARBALL="qdrant-x86_64-unknown-linux-musl.tar.gz" ;;
+          Linux-aarch64)  TARBALL="qdrant-aarch64-unknown-linux-musl.tar.gz" ;;
+        esac
+        QDRANT_DL="https://github.com/qdrant/qdrant/releases/download/${latest}/${TARBALL}"
         echo "  Downloading Qdrant $latest..."
-        launchctl unload "$HOME/Library/LaunchAgents/com.local.qdrant.plist" 2>/dev/null || true
-        curl -sL "$QDRANT_URL" | tar xz -C "$INSTALL_DIR"
+        if [[ "$OS" == "Linux" ]]; then
+          systemctl --user stop qdrant 2>/dev/null || true
+        else
+          launchctl unload "$HOME/Library/LaunchAgents/com.local.qdrant.plist" 2>/dev/null || true
+        fi
+        curl -sL "$QDRANT_DL" | tar xz -C "$INSTALL_DIR"
         chmod +x "$INSTALL_DIR/qdrant"
-        launchctl load "$HOME/Library/LaunchAgents/com.local.qdrant.plist" 2>/dev/null || true
+        if [[ "$OS" == "Linux" ]]; then
+          systemctl --user start qdrant 2>/dev/null || true
+        else
+          launchctl load "$HOME/Library/LaunchAgents/com.local.qdrant.plist" 2>/dev/null || true
+        fi
         ok "Qdrant upgraded to $latest"
       fi
     fi
