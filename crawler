@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""crawler — standalone web crawler with clean content extraction.
+
+Uses Playwright for JS rendering and readability-lxml for ad/nav stripping.
+
+Usage:
+  crawler <url> [options]
+
+Examples:
+  crawler https://docs.n8n.io/ --depth 2 --output ./crawled/
+  crawler https://some-article.com --single
+  crawler https://docs.n8n.io/ --depth 2 --format json
+  crawler https://docs.n8n.io/ --depth 1 --format text | grep "webhook"
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import hashlib
+import urllib.robotparser
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+LOG_FILE = Path("/tmp/crawler.log")
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts}  {msg}"
+    print(line, flush=True)
+    with LOG_FILE.open("a") as f:
+        f.write(line + "\n")
+
+
+def notify(message: str, title: str = "crawler", priority: int = 0):
+    token = os.environ.get("PUSHOVER_TOKEN")
+    user  = os.environ.get("PUSHOVER_USER")
+    if not token or not user:
+        return
+    try:
+        import urllib.parse
+        data = urllib.parse.urlencode({
+            "token": token, "user": user,
+            "title": title, "message": message, "priority": priority
+        }).encode()
+        urllib.request.urlopen(
+            urllib.request.Request("https://api.pushover.net/1/messages.json", data=data),
+            timeout=5
+        )
+    except Exception as e:
+        logger.warning(f"Pushover failed: {e}")
+
+
+def crawl(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dict]:
+    """Crawl URL, return list of {url, title, text, metadata}."""
+    from playwright.sync_api import sync_playwright
+    from readability import Document
+    from bs4 import BeautifulSoup
+    from urllib.parse import urljoin, urlparse
+
+    seed_parsed = urlparse(url)
+    seed_domain = seed_parsed.netloc
+    seed_prefix = seed_parsed.scheme + "://" + seed_parsed.netloc + seed_parsed.path
+
+    # Robots.txt
+    rp = urllib.robotparser.RobotFileParser()
+    rp.allow_all = True
+    if not ignore_robots:
+        try:
+            robots_url = f"{seed_parsed.scheme}://{seed_domain}/robots.txt"
+            with urllib.request.urlopen(robots_url, timeout=5) as resp:
+                content = resp.read().decode(errors="replace")
+            if "user-agent" in content.lower() and "<html" not in content.lower():
+                rp.allow_all = False
+                rp.set_url(robots_url)
+                rp.parse(content.splitlines())
+                rp._last_checked = 1
+        except Exception:
+            pass
+
+    visited, queued, queue, pages = set(), {url}, [(url, 0)], []
+    start = datetime.now()
+
+    log(f"[CRAWL] START {url} depth={depth}")
+    notify(f"🔄 Crawling {url} (depth={depth})")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        while queue:
+            current_url, current_depth = queue.pop(0)
+            if current_url in visited:
+                continue
+            visited.add(current_url)
+
+            if not ignore_robots and not rp.can_fetch("*", current_url):
+                continue
+
+            try:
+                page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(500)
+                html = page.content()
+            except Exception as e:
+                logger.warning(f"Failed to load {current_url}: {e}")
+                continue
+
+            # Extract clean content with readability
+            try:
+                doc = Document(html)
+                title = doc.title() or ""
+                clean_html = doc.summary()
+                soup = BeautifulSoup(clean_html, "html.parser")
+                text = soup.get_text(separator="\n", strip=True)
+            except Exception:
+                soup_raw = BeautifulSoup(html, "html.parser")
+                for tag in soup_raw(["script", "style", "nav", "footer", "header", "aside"]):
+                    tag.decompose()
+                title = soup_raw.title.string.strip() if soup_raw.title else ""
+                text = soup_raw.get_text(separator="\n", strip=True)
+
+            if not text.strip():
+                continue
+
+            pages.append({
+                "url": current_url,
+                "title": title,
+                "text": text,
+                "metadata": {
+                    "source_url": current_url,
+                    "page_title": title,
+                    "domain": seed_domain,
+                    "crawl_root": url,
+                    "depth_level": current_depth,
+                    "fetched_date": datetime.now(timezone.utc).date().isoformat(),
+                }
+            })
+
+            # Log progress every 10 pages
+            if len(pages) % 10 == 0 or len(pages) == 1:
+                elapsed = (datetime.now() - start).seconds
+                log(f"[CRAWL] {len(pages)} pages | queue: {len(queue)} | {elapsed}s elapsed")
+
+            # Runaway queue check
+            q_len = len(queue)
+            if len(pages) > 5 and q_len > len(pages) * 100:
+                msg = f"❌ Queue ({q_len}) > 100x pages ({len(pages)}) — aborting {url}"
+                log(f"[CRAWL] {msg}")
+                notify(msg, title="crawler error", priority=1)
+                break
+
+            # Follow links at next depth
+            if current_depth < depth:
+                link_soup = BeautifulSoup(html, "html.parser")
+                for a in link_soup.find_all("a", href=True):
+                    href = urljoin(current_url, a["href"]).split("#")[0]
+                    from urllib.parse import urlparse as up
+                    parsed = up(href)
+                    if (parsed.netloc == seed_domain
+                            and href.startswith(seed_prefix)
+                            and href not in visited
+                            and href not in queued
+                            and parsed.scheme in ("http", "https")):
+                        queued.add(href)
+                        queue.append((href, current_depth + 1))
+
+        browser.close()
+
+    elapsed = (datetime.now() - start).seconds
+    log(f"[CRAWL] DONE {len(pages)} pages in {elapsed}s from {url}")
+    notify(f"✅ Crawl done: {len(pages)} pages from {url} in {elapsed}s")
+    return pages
+
+
+def save_markdown(pages: list[dict], output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for pg in pages:
+        slug = hashlib.sha256(pg["url"].encode()).hexdigest()[:12]
+        safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in pg["title"])[:60].strip()
+        filename = f"{safe_title}_{slug}.md" if safe_title else f"{slug}.md"
+        content = f"# {pg['title']}\n\n"
+        content += f"**URL:** {pg['url']}  \n"
+        content += f"**Fetched:** {pg['metadata']['fetched_date']}  \n"
+        content += f"**Domain:** {pg['metadata']['domain']}\n\n"
+        content += "---\n\n"
+        content += pg["text"]
+        (output_dir / filename).write_text(content, encoding="utf-8")
+    log(f"[OUTPUT] Saved {len(pages)} markdown files → {output_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="crawler — web crawler with clean content extraction",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    parser.add_argument("url", help="URL to crawl")
+    parser.add_argument("--depth", type=int, default=0,
+                        help="Crawl depth (0=single page, 1=seed+links, 2=two levels)")
+    parser.add_argument("--single", action="store_true",
+                        help="Single page only (same as --depth 0)")
+    parser.add_argument("--output", "-o", help="Output directory for markdown files")
+    parser.add_argument("--format", choices=["markdown", "text", "json"], default="markdown",
+                        help="Output format when printing to stdout (default: markdown)")
+    parser.add_argument("--ignore-robots", action="store_true",
+                        help="Ignore robots.txt")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress progress logging")
+
+    args = parser.parse_args()
+
+    if args.quiet:
+        logging.disable(logging.CRITICAL)
+
+    depth = 0 if args.single else args.depth
+    pages = crawl(args.url, depth=depth, ignore_robots=args.ignore_robots)
+
+    if not pages:
+        print("No pages extracted.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        save_markdown(pages, Path(args.output))
+        print(f"✅ {len(pages)} pages saved to {args.output}")
+    else:
+        # Print to stdout
+        if args.format == "json":
+            print(json.dumps(pages, indent=2))
+        elif args.format == "text":
+            for pg in pages:
+                print(f"\n{'='*60}")
+                print(f"URL: {pg['url']}")
+                print(f"Title: {pg['title']}")
+                print('='*60)
+                print(pg["text"])
+        else:
+            # markdown to stdout
+            for pg in pages:
+                print(f"\n# {pg['title']}")
+                print(f"\n> {pg['url']}\n")
+                print(pg["text"])
+                print("\n---")
+
+
+if __name__ == "__main__":
+    main()
