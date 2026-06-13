@@ -268,8 +268,13 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
         rp = urllib.robotparser.RobotFileParser()
         if not ignore_robots:
             try:
-                rp.set_url(f"{seed_parsed.scheme}://{seed_domain}/robots.txt")
-                rp.read()
+                import urllib.request
+                robots_url = f"{seed_parsed.scheme}://{seed_domain}/robots.txt"
+                with urllib.request.urlopen(robots_url, timeout=5) as resp:
+                    content = resp.read().decode(errors="replace")
+                if "user-agent" in content.lower() and "<html" not in content.lower():
+                    rp.set_url(robots_url)
+                    rp.parse(content.splitlines())
             except Exception:
                 pass
 
