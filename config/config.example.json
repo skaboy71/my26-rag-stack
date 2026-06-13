@@ -1,0 +1,18 @@
+{
+  "qdrant_url": "http://localhost:6333",
+  "ollama_url": "http://localhost:11434",
+  "embedding_model": "qwen3-embedding:8b",
+  "reranker_model": "BAAI/bge-reranker-v2-m3",
+  "collections": ["files", "web", "pdfs", "code"],
+  "default_top_k": 8,
+  "embed_batch_size": 32,
+  "persistent_sources": [],
+  "web_sources": [],
+  "obsidian_vaults": [
+    {
+      "name": "personal",
+      "path": "/path/to/your/obsidian/vault",
+      "collection": "files"
+    }
+  ]
+}

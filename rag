@@ -1,0 +1,971 @@
+#!/usr/bin/env python3
+"""rag - Personal RAG CLI tool (personal laptop setup)"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import hashlib
+import re
+from pathlib import Path
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+CONFIG_PATH = Path(os.environ.get("RAG_CONFIG", str(Path.home() / ".config/rag/config.json")))
+
+DEFAULT_CONFIG = {
+    "qdrant_url": "http://192.168.1.30:6333",
+    "ollama_url": "http://localhost:11434",
+    "embedding_model": "qwen3-embedding:8b",
+    "reranker_model": "BAAI/bge-reranker-v2-m3",
+    "collections": ["files", "web", "pdfs", "code"],
+    "default_top_k": 8,
+    "embed_batch_size": 32,
+    "persistent_sources": [],
+    "web_sources": [],
+    "obsidian_vaults": [
+        {
+            "name": "personal",
+            "path": "/Users/atsmusz/My Drive (skaboy71@gmail.com)/__OBSIDIAN/GDRIVE",
+            "collection": "files"
+        }
+    ]
+}
+
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 64
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        return {**DEFAULT_CONFIG, **json.loads(CONFIG_PATH.read_text())}
+    return DEFAULT_CONFIG.copy()
+
+
+def save_config(cfg: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+# ── Embedding ──────────────────────────────────────────────────────────────────
+
+def embed(texts: list[str], cfg: dict) -> list[list[float]]:
+    import ollama as ol
+    client = ol.Client(host=cfg["ollama_url"])
+    results = []
+    batch = cfg.get("embed_batch_size", 32)
+    for i in range(0, len(texts), batch):
+        resp = client.embed(model=cfg["embedding_model"], input=texts[i:i+batch])
+        results.extend(resp.embeddings)
+    return results
+
+
+# ── Reranking ──────────────────────────────────────────────────────────────────
+
+_reranker = None
+
+def get_reranker(cfg: dict):
+    global _reranker
+    if _reranker is None:
+        from sentence_transformers import CrossEncoder
+        _reranker = CrossEncoder(cfg["reranker_model"])
+    return _reranker
+
+
+def rerank(query: str, results: list[dict], cfg: dict) -> list[dict]:
+    if not results:
+        return results
+    model = get_reranker(cfg)
+    pairs = [(query, r["text"]) for r in results]
+    scores = model.predict(pairs).tolist()
+    for r, s in zip(results, scores):
+        r["score"] = float(s)
+    return sorted(results, key=lambda x: x["score"], reverse=True)
+
+
+# ── Qdrant ─────────────────────────────────────────────────────────────────────
+
+def get_qdrant(cfg: dict):
+    from qdrant_client import QdrantClient
+    return QdrantClient(url=cfg["qdrant_url"], timeout=10)
+
+
+def ensure_collection(client, name: str, vector_size: int = 4096):
+    from qdrant_client.models import Distance, VectorParams
+    existing = [c.name for c in client.get_collections().collections]
+    if name not in existing:
+        client.create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
+        print(f"✅ Created collection: {name}")
+
+
+def upsert_chunks(client, collection: str, chunks: list[dict], vectors: list[list[float]]):
+    from qdrant_client.models import PointStruct
+    points = []
+    for chunk, vec in zip(chunks, vectors):
+        uid = hashlib.sha256((chunk["text"] + str(chunk["metadata"])).encode()).hexdigest()[:16]
+        points.append(PointStruct(
+            id=int(uid, 16) % (2**63),
+            vector=vec,
+            payload={"text": chunk["text"], **chunk["metadata"]}
+        ))
+    client.upsert(collection_name=collection, points=points)
+
+
+def search_collection(client, collection: str, vector: list[float], top_k: int) -> list[dict]:
+    try:
+        result = client.query_points(
+            collection_name=collection,
+            query=vector,
+            limit=top_k,
+            with_payload=True,
+        )
+        results = []
+        for h in result.points:
+            payload = dict(h.payload)
+            text = payload.pop("text", "")
+            results.append({"text": text, "score": h.score, "collection": collection, "metadata": payload})
+        return results
+    except Exception as e:
+        logger.warning(f"Search failed on {collection}: {e}")
+        return []
+
+
+# ── Chunking ───────────────────────────────────────────────────────────────────
+
+def chunk_text(text: str, metadata: dict) -> list[dict]:
+    """Split text into overlapping chunks at sentence/paragraph boundaries."""
+    paragraphs = re.split(r'\n{2,}', text.strip())
+    chunks, current, current_len = [], [], 0
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        words = para.split()
+        if current_len + len(words) > CHUNK_SIZE:
+            if current:
+                chunk_text_str = " ".join(current)
+                chunks.append({"text": chunk_text_str, "metadata": dict(metadata)})
+            overlap = current[-CHUNK_OVERLAP:] if len(current) > CHUNK_OVERLAP else current
+            current = overlap + words
+            current_len = len(current)
+        else:
+            current.extend(words)
+            current_len += len(words)
+    if current:
+        chunks.append({"text": " ".join(current), "metadata": dict(metadata)})
+    return chunks if chunks else [{"text": text[:4000], "metadata": dict(metadata)}]
+
+
+def chunk_code(path: Path) -> list[dict]:
+    """Tree-sitter based chunking by symbol boundary."""
+    try:
+        import tree_sitter_languages
+        from tree_sitter import Language, Parser
+        lang_map = {
+            ".py": "python", ".java": "java", ".js": "javascript",
+            ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript",
+            ".html": "html", ".css": "css",
+        }
+        suffix = path.suffix.lower()
+        lang_name = lang_map.get(suffix)
+        if not lang_name:
+            return chunk_text(path.read_text(errors="replace"),
+                              {"file_path": str(path), "language": suffix.lstrip(".")})
+
+        lang = Language(tree_sitter_languages.get_language(lang_name))
+        parser = Parser(lang)
+        src = path.read_bytes()
+        tree = parser.parse(src)
+
+        symbol_types = {
+            "python": {"function_definition", "class_definition"},
+            "java": {"method_declaration", "class_declaration"},
+            "javascript": {"function_declaration", "arrow_function", "class_declaration", "method_definition"},
+            "typescript": {"function_declaration", "arrow_function", "class_declaration", "method_definition"},
+            "html": {"element"}, "css": {"rule_set"},
+        }
+
+        chunks = []
+        types = symbol_types.get(lang_name, set())
+
+        def walk(node):
+            if node.type in types:
+                text = src[node.start_byte:node.end_byte].decode(errors="replace")
+                name = ""
+                for child in node.children:
+                    if child.type == "identifier":
+                        name = src[child.start_byte:child.end_byte].decode()
+                        break
+                chunks.append({
+                    "text": text,
+                    "metadata": {
+                        "file_path": str(path),
+                        "language": lang_name,
+                        "symbol_name": name,
+                        "symbol_type": node.type,
+                        "start_line": node.start_point[0] + 1,
+                        "end_line": node.end_point[0] + 1,
+                    }
+                })
+            else:
+                for child in node.children:
+                    walk(child)
+
+        walk(tree.root_node)
+        if not chunks:
+            return chunk_text(src.decode(errors="replace"),
+                              {"file_path": str(path), "language": lang_name})
+        return chunks
+    except ImportError:
+        logger.warning("tree-sitter-languages not installed — falling back to text chunking")
+        return chunk_text(path.read_text(errors="replace"),
+                          {"file_path": str(path), "language": path.suffix.lstrip(".")})
+
+
+def extract_file(path: Path) -> str:
+    """Extract text from PDF, docx, or plain text."""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            return "\n\n".join(p.extract_text() or "" for p in reader.pages)
+        except Exception as e:
+            logger.error(f"PDF extraction failed: {e}")
+            return ""
+    elif suffix == ".docx":
+        try:
+            from docx import Document
+            doc = Document(str(path))
+            return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception as e:
+            logger.error(f"DOCX extraction failed: {e}")
+            return ""
+    else:
+        return path.read_text(errors="replace")
+
+
+# ── Web Crawler ────────────────────────────────────────────────────────────────
+
+def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dict]:
+    """Crawl URL with Playwright + BeautifulSoup. Returns list of {url, text, title}."""
+    try:
+        from playwright.sync_api import sync_playwright
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin, urlparse
+        import urllib.robotparser
+
+        seed_parsed = urlparse(url)
+        seed_domain = seed_parsed.netloc
+        seed_prefix = seed_parsed.scheme + "://" + seed_parsed.netloc + seed_parsed.path
+
+        rp = urllib.robotparser.RobotFileParser()
+        if not ignore_robots:
+            try:
+                rp.set_url(f"{seed_parsed.scheme}://{seed_domain}/robots.txt")
+                rp.read()
+            except Exception:
+                pass
+
+        visited, queue, pages = set(), [(url, 0)], []
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            while queue:
+                current_url, current_depth = queue.pop(0)
+                if current_url in visited:
+                    continue
+                visited.add(current_url)
+
+                if not ignore_robots and not rp.can_fetch("*", current_url):
+                    continue
+
+                try:
+                    page.goto(current_url, wait_until="networkidle", timeout=15000)
+                    html = page.content()
+                except Exception as e:
+                    logger.warning(f"Failed to load {current_url}: {e}")
+                    continue
+
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup(["script", "style", "nav", "footer", "header"]):
+                    tag.decompose()
+                title = soup.title.string.strip() if soup.title else ""
+                text = soup.get_text(separator="\n", strip=True)
+                pages.append({"url": current_url, "text": text, "title": title})
+
+                if current_depth < depth:
+                    for a in soup.find_all("a", href=True):
+                        href = urljoin(current_url, a["href"]).split("#")[0]
+                        parsed = urlparse(href)
+                        if (parsed.netloc == seed_domain
+                                and href.startswith(seed_prefix)
+                                and href not in visited
+                                and parsed.scheme in ("http", "https")):
+                            queue.append((href, current_depth + 1))
+
+            browser.close()
+        return pages
+    except ImportError:
+        print("❌ playwright not installed. Run: pip install playwright && playwright install chromium")
+        sys.exit(1)
+
+
+# ── Ingest helpers ─────────────────────────────────────────────────────────────
+
+def ingest_chunks(chunks: list[dict], collection: str, cfg: dict):
+    if not chunks:
+        print("⚠️  No chunks to ingest")
+        return
+    client = get_qdrant(cfg)
+    texts = [c["text"] for c in chunks]
+    print(f"🔄 Embedding {len(chunks)} chunks...")
+    vectors = embed(texts, cfg)
+    vector_size = len(vectors[0])
+    ensure_collection(client, collection, vector_size)
+    upsert_chunks(client, collection, chunks, vectors)
+    print(f"✅ Ingested {len(chunks)} chunks → {collection}")
+
+
+def delete_file_points(client, collection: str, file_path: str):
+    """Delete all Qdrant points whose file_path metadata matches."""
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, FilterSelector
+    try:
+        client.delete(
+            collection_name=collection,
+            points_selector=FilterSelector(
+                filter=Filter(must=[FieldCondition(key="file_path", match=MatchValue(value=file_path))])
+            )
+        )
+    except Exception as e:
+        logger.warning(f"Could not delete points for {file_path}: {e}")
+
+
+def delete_url_points(client, collection: str, url: str):
+    """Delete all Qdrant points whose source_url metadata matches."""
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, FilterSelector
+    try:
+        client.delete(
+            collection_name=collection,
+            points_selector=FilterSelector(
+                filter=Filter(must=[FieldCondition(key="source_url", match=MatchValue(value=url))])
+            )
+        )
+    except Exception as e:
+        logger.warning(f"Could not delete points for {url}: {e}")
+
+
+def _collect_dir_files(dirpath: Path, code_only: bool = False) -> list[Path]:
+    code_exts = {".py", ".java", ".js", ".jsx", ".ts", ".tsx", ".html", ".css"}
+    files = []
+    for f in sorted(dirpath.rglob("*")):
+        if not f.is_file():
+            continue
+        if any(p.startswith(".") for p in f.parts):
+            continue
+        if code_only and f.suffix.lower() not in code_exts:
+            continue
+        files.append(f)
+    return files
+
+
+def refresh_dir_source(source: dict, cfg: dict) -> dict:
+    """Delta-refresh a dir or codebase persistent source. Returns updated source entry."""
+    dirpath = Path(source["path"])
+    collection = source["collection"]
+    source_type = source.get("type", "dir")
+    old_manifest = source.get("manifest", {})  # {str(path): mtime}
+
+    if not dirpath.is_dir():
+        print(f"⚠️  Source path missing: {dirpath}")
+        return source
+
+    code_only = source_type == "codebase"
+    current_files = {str(f): f.stat().st_mtime for f in _collect_dir_files(dirpath, code_only)}
+
+    # Files removed since last ingest → delete from Qdrant
+    removed = set(old_manifest) - set(current_files)
+    if removed:
+        client = get_qdrant(cfg)
+        for path_str in removed:
+            delete_file_points(client, collection, path_str)
+            print(f"   🗑️  Removed: {Path(path_str).name}")
+
+    # Files added or modified → re-embed
+    to_ingest = {p: m for p, m in current_files.items()
+                 if p not in old_manifest or old_manifest[p] != m}
+
+    if to_ingest:
+        all_chunks = []
+        for path_str in sorted(to_ingest):
+            f = Path(path_str)
+            try:
+                if code_only:
+                    all_chunks.extend(chunk_code(f))
+                else:
+                    suffix = f.suffix.lower()
+                    if suffix == ".pdf":
+                        text = extract_file(f)
+                        meta = {"file_path": path_str, "file_name": f.name, "file_type": "pdf",
+                                "ingested_date": datetime.now(timezone.utc).isoformat()}
+                        all_chunks.extend(chunk_text(text, meta))
+                    elif suffix == ".docx":
+                        text = extract_file(f)
+                        meta = {"file_path": path_str, "file_name": f.name, "file_type": "docx"}
+                        all_chunks.extend(chunk_text(text, meta))
+                    else:
+                        text = extract_file(f)
+                        meta = {"file_path": path_str, "file_name": f.name,
+                                "file_type": suffix.lstrip(".")}
+                        all_chunks.extend(chunk_text(text, meta))
+            except Exception as e:
+                logger.warning(f"Skipping {f}: {e}")
+        if all_chunks:
+            # Delete old chunks for changed files before upserting new ones
+            client = get_qdrant(cfg)
+            for path_str in to_ingest:
+                delete_file_points(client, collection, path_str)
+            ingest_chunks(all_chunks, collection, cfg)
+        print(f"   ✅ {len(to_ingest)} files updated, {len(removed)} removed")
+    else:
+        print(f"   ✅ No changes ({len(current_files)} files)")
+
+    source["manifest"] = current_files
+    return source
+
+
+def refresh_url_source(source: dict, cfg: dict) -> dict:
+    """Delta-refresh a URL persistent source. Returns updated source entry."""
+    url = source["url"]
+    collection = source["collection"]
+    depth = source.get("depth", 0)
+    old_hashes = source.get("page_hashes", {})  # {url: sha256(text[:4096])}
+
+    print(f"🔄 Crawling {url} (depth={depth})...")
+    pages = crawl_url(url, depth=depth, ignore_robots=source.get("ignore_robots", False))
+    print(f"   Found {len(pages)} pages")
+
+    seed_domain = url.split("/")[2] if "//" in url else ""
+    new_hashes = {}
+    to_embed = []
+    unchanged = 0
+
+    for pg in pages:
+        content_hash = hashlib.sha256(pg["text"].encode()).hexdigest()
+        new_hashes[pg["url"]] = content_hash
+        if old_hashes.get(pg["url"]) == content_hash:
+            unchanged += 1
+            continue
+        to_embed.append(pg)
+
+    # Pages that disappeared → delete from Qdrant
+    removed_urls = set(old_hashes) - set(new_hashes)
+    if removed_urls:
+        client = get_qdrant(cfg)
+        for removed_url in removed_urls:
+            delete_url_points(client, collection, removed_url)
+        print(f"   🗑️  Removed {len(removed_urls)} disappeared pages")
+
+    if to_embed:
+        all_chunks = []
+        for pg in to_embed:
+            # Delete old chunks for this URL before re-embedding
+            if pg["url"] in old_hashes:
+                client = get_qdrant(cfg)
+                delete_url_points(client, collection, pg["url"])
+            meta = {
+                "source_url": pg["url"], "page_title": pg["title"],
+                "domain": seed_domain, "depth": depth, "crawl_root": url,
+                "fetched_date": datetime.now(timezone.utc).date().isoformat(),
+            }
+            all_chunks.extend(chunk_text(pg["text"], meta))
+        ingest_chunks(all_chunks, collection, cfg)
+        print(f"   ✅ {len(to_embed)} pages updated, {unchanged} unchanged")
+    else:
+        print(f"   ✅ No changes ({unchanged} pages)")
+
+    source["page_hashes"] = new_hashes
+    return source
+
+
+def _save_persistent_source(cfg: dict, entry: dict):
+    """Add or update a persistent source entry, matched by type+path/url."""
+    sources = cfg.get("persistent_sources", [])
+    key = entry.get("path") or entry.get("url")
+    for i, s in enumerate(sources):
+        if (s.get("path") or s.get("url")) == key and s.get("type") == entry.get("type"):
+            sources[i] = entry
+            cfg["persistent_sources"] = sources
+            save_config(cfg)
+            return
+    sources.append(entry)
+    cfg["persistent_sources"] = sources
+    save_config(cfg)
+
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+def cmd_status(args, cfg):
+    print("Checking RAG stack status...\n")
+    # Qdrant
+    try:
+        client = get_qdrant(cfg)
+        info = client.get_collections()
+        print(f"✅ Qdrant:     connected  ({cfg['qdrant_url']})")
+        coll_names = [c.name for c in info.collections]
+    except Exception as e:
+        print(f"❌ Qdrant:     unreachable ({cfg['qdrant_url']}) — {e}")
+        coll_names = []
+
+    # Ollama
+    try:
+        import ollama as ol
+        client_ol = ol.Client(host=cfg["ollama_url"])
+        models = [m.model for m in client_ol.list().models]
+        print(f"✅ Ollama:     connected  ({cfg['ollama_url']})")
+        embed_model = cfg["embedding_model"]
+        if any(embed_model in m for m in models):
+            print(f"✅ Embedding:  {embed_model}  available")
+        else:
+            print(f"⚠️  Embedding:  {embed_model}  NOT found (run: ollama pull {embed_model})")
+    except Exception as e:
+        print(f"❌ Ollama:     unreachable ({cfg['ollama_url']}) — {e}")
+
+    # Reranker
+    try:
+        from sentence_transformers import CrossEncoder
+        print(f"✅ Reranker:   {cfg['reranker_model']}  (sentence-transformers)")
+    except ImportError:
+        print(f"❌ Reranker:   sentence-transformers not installed")
+
+    # Collections
+    print()
+    if coll_names:
+        try:
+            qdrant = get_qdrant(cfg)
+            for name in sorted(coll_names):
+                info = qdrant.get_collection(name)
+                count = info.points_count
+                print(f"   {name:<12} {count:>6} docs")
+        except Exception:
+            print("   (could not get collection details)")
+    else:
+        print("   No collections found")
+
+
+def cmd_query(args, cfg):
+    import concurrent.futures
+
+    query = args.query
+    top_k = args.top_k or cfg["default_top_k"]
+    collections = args.collections.split(",") if args.collections else cfg["collections"]
+
+    # Embed query
+    try:
+        vec = embed([query], cfg)[0]
+    except Exception as e:
+        print(f"❌ Embedding failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Parallel search across collections
+    retrieve_k = top_k * 4
+    results = []
+    try:
+        client = get_qdrant(cfg)
+        with concurrent.futures.ThreadPoolExecutor() as ex:
+            futures = {ex.submit(search_collection, client, c, vec, retrieve_k): c for c in collections}
+            for f in concurrent.futures.as_completed(futures):
+                results.extend(f.result())
+    except Exception as e:
+        print(f"❌ Qdrant search failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not results:
+        if args.json:
+            print("[]")
+        else:
+            print("No results found.")
+        return
+
+    # Rerank or sort by embedding score
+    if not args.no_rerank:
+        try:
+            results = rerank(query, results, cfg)
+        except Exception as e:
+            logger.warning(f"Reranking failed, falling back to embedding scores: {e}")
+            results.sort(key=lambda x: x["score"], reverse=True)
+    else:
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+    results = results[:top_k]
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        for i, r in enumerate(results, 1):
+            score = r["score"]
+            coll = r["collection"]
+            meta = r["metadata"]
+            src = meta.get("file_path") or meta.get("source_url") or meta.get("symbol_name") or ""
+            print(f"\n[{i}] score={score:.3f} | {coll} | {src}")
+            print("─" * 60)
+            print(r["text"][:400])
+
+
+def cmd_add(args, cfg):
+    collection = args.collection or "files"
+
+    if args.web is not None:
+        sources = cfg.get("web_sources", [])
+        if not sources:
+            print("❌ No web_sources configured in rag_personal_config.json")
+            print("   Add entries like: {\"name\": \"spring-docs\", \"url\": \"https://...\", \"depth\": 2, \"collection\": \"web\"}")
+            sys.exit(1)
+        if args.web == "__all__":
+            targets = sources
+        else:
+            targets = [s for s in sources if s["name"] == args.web]
+            if not targets:
+                names = [s["name"] for s in sources]
+                print(f"❌ Web source '{args.web}' not found. Available: {', '.join(names)}")
+                sys.exit(1)
+        for ws in targets:
+            url = ws["url"]
+            depth = ws.get("depth", 0)
+            coll = args.collection or ws.get("collection", "web")
+            print(f"🌐 Crawling: {ws['name']} — {url} (depth={depth})")
+            pages = crawl_url(url, depth=depth, ignore_robots=ws.get("ignore_robots", False))
+            print(f"   Found {len(pages)} pages")
+            page_hashes, all_chunks = {}, []
+            seed_domain = url.split("/")[2] if "//" in url else ""
+            for pg in pages:
+                page_hashes[pg["url"]] = hashlib.sha256(pg["text"].encode()).hexdigest()
+                meta = {"source_url": pg["url"], "page_title": pg["title"],
+                        "domain": seed_domain, "depth": depth, "crawl_root": url,
+                        "fetched_date": datetime.now(timezone.utc).date().isoformat(),
+                        "web_source_name": ws["name"]}
+                all_chunks.extend(chunk_text(pg["text"], meta))
+            ingest_chunks(all_chunks, coll, cfg)
+            cfg = load_config()
+            _save_persistent_source(cfg, {
+                "type": "url", "url": url, "depth": depth, "collection": coll,
+                "ignore_robots": ws.get("ignore_robots", False),
+                "page_hashes": page_hashes, "web_source_name": ws["name"],
+            })
+            print(f"   ✅ '{ws['name']}' saved as persistent source ({len(page_hashes)} pages tracked)")
+        return
+
+    if args.obsidian is not None:
+        vaults = cfg.get("obsidian_vaults", [])
+        if not vaults:
+            print("❌ No obsidian_vaults configured in rag_personal_config.json")
+            sys.exit(1)
+        if args.obsidian == "__all__":
+            targets = vaults
+        else:
+            targets = [v for v in vaults if v["name"] == args.obsidian]
+            if not targets:
+                names = [v["name"] for v in vaults]
+                print(f"❌ Vault '{args.obsidian}' not found. Available: {', '.join(names)}")
+                sys.exit(1)
+        for vault in targets:
+            print(f"🗂️  Ingesting Obsidian vault: {vault['name']} ({vault['path']})")
+            dirpath = Path(vault["path"])
+            if not dirpath.is_dir():
+                print(f"   ❌ Path not found: {dirpath}")
+                continue
+            coll = args.collection or vault.get("collection", "files")
+            all_chunks, manifest = [], {}
+            for f in _collect_dir_files(dirpath, code_only=False):
+                try:
+                    manifest[str(f)] = f.stat().st_mtime
+                    text = extract_file(f)
+                    suffix = f.suffix.lower()
+                    meta = {"file_path": str(f), "file_name": f.name,
+                            "file_type": suffix.lstrip("."),
+                            "obsidian_vault": vault["name"]}
+                    all_chunks.extend(chunk_text(text, meta))
+                except Exception as e:
+                    logger.warning(f"Skipping {f}: {e}")
+            ingest_chunks(all_chunks, coll, cfg)
+            cfg = load_config()
+            _save_persistent_source(cfg, {
+                "type": "dir", "path": str(dirpath), "collection": coll,
+                "manifest": manifest, "obsidian_vault": vault["name"],
+            })
+            print(f"   ✅ Vault '{vault['name']}' saved as persistent source ({len(manifest)} files)")
+        return
+
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            print(f"❌ File not found: {path}")
+            sys.exit(1)
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            collection = args.collection or "pdfs"
+            text = extract_file(path)
+            meta = {"file_path": str(path), "file_name": path.name,
+                    "file_type": "pdf", "ingested_date": datetime.now(timezone.utc).isoformat()}
+            chunks = chunk_text(text, meta)
+        elif suffix == ".docx":
+            text = extract_file(path)
+            meta = {"file_path": str(path), "file_name": path.name,
+                    "file_type": "docx", "modified_date": str(path.stat().st_mtime)}
+            chunks = chunk_text(text, meta)
+        elif suffix in (".py", ".java", ".js", ".jsx", ".ts", ".tsx", ".html", ".css"):
+            collection = args.collection or "code"
+            chunks = chunk_code(path)
+        else:
+            text = extract_file(path)
+            meta = {"file_path": str(path), "file_name": path.name, "file_type": suffix.lstrip(".")}
+            chunks = chunk_text(text, meta)
+        ingest_chunks(chunks, collection, cfg)
+
+    elif args.dir:
+        dirpath = Path(args.dir)
+        if not dirpath.is_dir():
+            print(f"❌ Not a directory: {dirpath}")
+            sys.exit(1)
+        all_chunks = []
+        manifest = {}
+        for f in _collect_dir_files(dirpath, code_only=False):
+            try:
+                manifest[str(f)] = f.stat().st_mtime
+                suffix = f.suffix.lower()
+                if suffix == ".pdf":
+                    text = extract_file(f)
+                    meta = {"file_path": str(f), "file_name": f.name, "file_type": "pdf",
+                            "ingested_date": datetime.now(timezone.utc).isoformat()}
+                    all_chunks.extend(chunk_text(text, meta))
+                elif suffix == ".docx":
+                    text = extract_file(f)
+                    meta = {"file_path": str(f), "file_name": f.name, "file_type": "docx"}
+                    all_chunks.extend(chunk_text(text, meta))
+                else:
+                    text = extract_file(f)
+                    meta = {"file_path": str(f), "file_name": f.name, "file_type": suffix.lstrip(".")}
+                    all_chunks.extend(chunk_text(text, meta))
+            except Exception as e:
+                logger.warning(f"Skipping {f}: {e}")
+        ingest_chunks(all_chunks, collection, cfg)
+        cfg = load_config()
+        _save_persistent_source(cfg, {
+            "type": "dir", "path": str(dirpath), "collection": collection, "manifest": manifest
+        })
+        print(f"✅ Saved as persistent source ({len(manifest)} files tracked)")
+
+    elif args.codebase:
+        dirpath = Path(args.codebase)
+        if not dirpath.is_dir():
+            print(f"❌ Not a directory: {dirpath}")
+            sys.exit(1)
+        collection = args.collection or "code"
+        all_chunks = []
+        manifest = {}
+        for f in _collect_dir_files(dirpath, code_only=True):
+            try:
+                manifest[str(f)] = f.stat().st_mtime
+                all_chunks.extend(chunk_code(f))
+            except Exception as e:
+                logger.warning(f"Skipping {f}: {e}")
+        ingest_chunks(all_chunks, collection, cfg)
+        cfg = load_config()
+        _save_persistent_source(cfg, {
+            "type": "codebase", "path": str(dirpath), "collection": collection, "manifest": manifest
+        })
+        print(f"✅ Saved as persistent source ({len(manifest)} files tracked)")
+
+    elif args.url:
+        collection = args.collection or "web"
+        depth = args.depth or 0
+        print(f"🔄 Crawling {args.url} (depth={depth})...")
+        pages = crawl_url(args.url, depth=depth, ignore_robots=args.ignore_robots)
+        print(f"   Found {len(pages)} pages")
+        all_chunks = []
+        page_hashes = {}
+        seed_domain = args.url.split("/")[2] if "//" in args.url else ""
+        for pg in pages:
+            page_hashes[pg["url"]] = hashlib.sha256(pg["text"].encode()).hexdigest()
+            meta = {
+                "source_url": pg["url"],
+                "page_title": pg["title"],
+                "domain": seed_domain,
+                "depth": depth,
+                "crawl_root": args.url,
+                "fetched_date": datetime.now(timezone.utc).date().isoformat(),
+            }
+            all_chunks.extend(chunk_text(pg["text"], meta))
+        ingest_chunks(all_chunks, collection, cfg)
+
+        if args.persistent:
+            cfg = load_config()
+            _save_persistent_source(cfg, {
+                "type": "url", "url": args.url, "depth": depth, "collection": collection,
+                "ignore_robots": args.ignore_robots, "page_hashes": page_hashes,
+            })
+            # Also register in web_sources for discoverability/management
+            web_sources = cfg.get("web_sources", [])
+            existing_urls = [w["url"] for w in web_sources]
+            if args.url not in existing_urls:
+                from urllib.parse import urlparse
+                default_name = urlparse(args.url).netloc.replace("www.", "")
+                web_sources.append({
+                    "name": default_name, "url": args.url,
+                    "depth": depth, "collection": collection,
+                    "ignore_robots": args.ignore_robots,
+                })
+                cfg["web_sources"] = web_sources
+                save_config(cfg)
+            print(f"✅ Saved as persistent source ({len(page_hashes)} pages tracked)")
+    else:
+        print("❌ Specify one of: --file, --dir, --codebase, --url")
+        sys.exit(1)
+
+
+def cmd_collections(args, cfg):
+    sub = args.subcommand
+
+    if sub == "list":
+        try:
+            client = get_qdrant(cfg)
+            colls = client.get_collections().collections
+            if not colls:
+                print("No collections found.")
+                return
+            print(f"{'Collection':<16} {'Docs':>8}")
+            print("─" * 26)
+            for c in sorted(colls, key=lambda x: x.name):
+                info = client.get_collection(c.name)
+                print(f"{c.name:<16} {info.points_count:>8}")
+        except Exception as e:
+            print(f"❌ {e}")
+
+    elif sub == "status":
+        cfg_data = load_config()
+        sources = cfg_data.get("persistent_sources", [])
+        if not sources:
+            print("No persistent sources configured.")
+            return
+        print(f"{'Type':<10} {'Source':<48} {'Collection':<12} {'Tracked'}")
+        print("─" * 82)
+        for s in sources:
+            stype = s.get("type", "url")
+            label = s.get("path") or s.get("url", "")
+            label = label[:47]
+            coll = s.get("collection", "")
+            if stype == "url":
+                tracked = f"{len(s.get('page_hashes', {}))} pages"
+            else:
+                tracked = f"{len(s.get('manifest', {}))} files"
+            print(f"{stype:<10} {label:<48} {coll:<12} {tracked}")
+
+    elif sub == "refresh":
+        cfg_data = load_config()
+        sources = cfg_data.get("persistent_sources", [])
+        if not sources:
+            print("No persistent sources to refresh.")
+            return
+        updated_sources = []
+        for s in sources:
+            stype = s.get("type", "url")
+            label = s.get("path") or s.get("url", "")
+            print(f"\n🔄 [{stype}] {label}")
+            if stype in ("dir", "codebase"):
+                s = refresh_dir_source(s, cfg_data)
+            elif stype == "url":
+                s = refresh_url_source(s, cfg_data)
+            else:
+                print(f"   ⚠️  Unknown source type: {stype}")
+            updated_sources.append(s)
+        cfg_data["persistent_sources"] = updated_sources
+        save_config(cfg_data)
+        print("\n✅ Refresh complete. Manifests updated.")
+
+    elif sub == "rebuild":
+        name = args.name
+        try:
+            client = get_qdrant(cfg)
+            if name == "--all":
+                colls = [c.name for c in client.get_collections().collections]
+            else:
+                colls = [name]
+            for c in colls:
+                client.delete_collection(c)
+                print(f"🗑️  Deleted collection: {c}")
+            print("⚠️  Collections deleted. Re-ingest your sources to rebuild.")
+        except Exception as e:
+            print(f"❌ {e}")
+    else:
+        print(f"❌ Unknown subcommand: {sub}")
+        sys.exit(1)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="rag — personal RAG CLI (Qdrant + Ollama + sentence-transformers)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # status
+    sub.add_parser("status", help="Check stack health")
+
+    # query
+    q = sub.add_parser("query", help="Query across collections")
+    q.add_argument("query", help="Query string")
+    q.add_argument("--json", action="store_true", help="Output JSON")
+    q.add_argument("--collections", help="Comma-separated collection names")
+    q.add_argument("--top-k", type=int, dest="top_k", help="Number of results")
+    q.add_argument("--no-rerank", action="store_true", help="Skip reranker")
+
+    # add
+    a = sub.add_parser("add", help="Ingest content")
+    a.add_argument("--file", help="Path to file")
+    a.add_argument("--dir", help="Path to directory")
+    a.add_argument("--codebase", help="Path to source code directory (tree-sitter chunking)")
+    a.add_argument("--url", help="URL to crawl")
+    a.add_argument("--obsidian", nargs="?", const="__all__", metavar="VAULT_NAME",
+                   help="Ingest Obsidian vault(s) from config. Omit name to ingest all.")
+    a.add_argument("--web", nargs="?", const="__all__", metavar="SOURCE_NAME",
+                   help="Ingest web source(s) from config. Omit name to ingest all.")
+    a.add_argument("--collection", help="Target collection (default: auto-detect)")
+    a.add_argument("--depth", type=int, default=0, help="Crawl depth for --url")
+    a.add_argument("--watch", action="store_true", help="Watch for changes (stub)")
+    a.add_argument("--persistent", action="store_true", help="Re-crawl on rag collections refresh")
+    a.add_argument("--ignore-robots", action="store_true", help="Ignore robots.txt")
+
+    # collections
+    c = sub.add_parser("collections", help="Manage collections")
+    c.add_argument("subcommand", choices=["list", "status", "refresh", "rebuild"])
+    c.add_argument("name", nargs="?", help="Collection name (for rebuild), or --all")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    cfg = load_config()
+
+    if args.command == "status":
+        cmd_status(args, cfg)
+    elif args.command == "query":
+        cmd_query(args, cfg)
+    elif args.command == "add":
+        cmd_add(args, cfg)
+    elif args.command == "collections":
+        cmd_collections(args, cfg)
+
+
+if __name__ == "__main__":
+    main()
