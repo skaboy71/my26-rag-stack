@@ -4,21 +4,20 @@
 import argparse
 import json
 import logging
+import os
 import sys
-import time
 import hashlib
 import re
 from pathlib import Path
-from typing import Optional
 from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = Path.home() / "__CURSOR/claude_files/rag_personal_config.json"
+CONFIG_PATH = Path(os.environ.get("RAG_CONFIG", str(Path.home() / ".config/rag/config.json")))
 
 DEFAULT_CONFIG = {
-    "qdrant_url": "http://192.168.1.30:6333",
+    "qdrant_url": "http://localhost:6333",
     "ollama_url": "http://localhost:11434",
     "embedding_model": "qwen3-embedding:8b",
     "reranker_model": "BAAI/bge-reranker-v2-m3",
@@ -30,7 +29,7 @@ DEFAULT_CONFIG = {
     "obsidian_vaults": [
         {
             "name": "personal",
-            "path": "/Users/atsmusz/My Drive (skaboy71@gmail.com)/__OBSIDIAN/GDRIVE",
+            "path": "/path/to/your/obsidian/vault",
             "collection": "files"
         }
     ]
