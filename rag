@@ -289,7 +289,8 @@ def crawl_url(url: str, depth: int = 0, ignore_robots: bool = False) -> list[dic
                     continue
 
                 try:
-                    page.goto(current_url, wait_until="networkidle", timeout=15000)
+                    page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(500)
                     html = page.content()
                 except Exception as e:
                     logger.warning(f"Failed to load {current_url}: {e}")
